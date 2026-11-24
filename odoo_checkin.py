@@ -2,20 +2,39 @@
 
 import argparse
 import json
+import math
 import os
 import random
+import re
+import subprocess
 import sys
 import time
 from pathlib import Path
 from datetime import date, datetime, time as dtime, timedelta, timezone
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 EXIT_DONE, EXIT_ERROR, EXIT_SKIPPED = 0, 1, 10
 ODOO_DT = "%Y-%m-%d %H:%M:%S"
 BASE_DIR = Path(__file__).resolve().parent
+
+GEOCLUE_QUERY = r'''
+import json
+import gi
+gi.require_version("Geoclue", "2.0")
+from gi.repository import Geoclue
+
+client = Geoclue.Simple.new_sync("google-chrome", Geoclue.AccuracyLevel.EXACT, None)
+location = client.get_location()
+print(json.dumps({
+    "latitude": location.get_property("latitude"),
+    "longitude": location.get_property("longitude"),
+    "accuracy": location.get_property("accuracy"),
+}))
+'''
 
 
 def emit(status, reason, exit_code, **extra):
@@ -87,6 +106,84 @@ def call_kw(page, base_url, model, method, args, **kwargs):
     """
     return rpc(page, base_url, f"/web/dataset/call_kw/{model}/{method}",
                {"model": model, "method": method, "args": args, "kwargs": kwargs})
+
+
+def create_attendance_context(browser, base_url):
+    """Create a fresh browser context without implicit location access.
+    :param browser: Playwright Chromium browser
+    :param base_url: configured Odoo base URL
+    :return: isolated browser context
+    """
+    parsed = urlsplit(base_url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError("ODOO_URL must include an http(s) origin")
+    return browser.new_context()
+
+
+def query_geoclue_location():
+    """Read a fresh GeoClue fix via system Python; never log raw coordinates.
+    :return: Playwright geolocation dict, or None when GeoClue is unavailable
+    """
+    try:
+        result = subprocess.run(
+            ["/usr/bin/python3", "-c", GEOCLUE_QUERY],
+            capture_output=True,
+            text=True,
+            timeout=25,
+            check=True,
+        )
+        position = json.loads(result.stdout)
+        latitude = position["latitude"]
+        longitude = position["longitude"]
+        accuracy = position["accuracy"]
+        values = (latitude, longitude, accuracy)
+        if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+               for value in values):
+            return None
+        if not (-90 <= latitude <= 90 and -180 <= longitude <= 180 and accuracy >= 0):
+            return None
+        return {"latitude": latitude, "longitude": longitude, "accuracy": accuracy}
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def configure_attendance_geolocation(context, base_url, geolocation):
+    """Inject a fresh fix and grant location permission only to the Odoo origin.
+    :return: True if configured, False if no fix is available
+    """
+    if geolocation is None:
+        return False
+    parsed = urlsplit(base_url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError("ODOO_URL must include an http(s) origin")
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    context.set_geolocation(geolocation)
+    context.grant_permissions(["geolocation"], origin=origin)
+    return True
+
+
+def verify_page_geolocation(page, geolocation):
+    """Check navigator.geolocation against the injected fix without returning coordinates."""
+    if geolocation is None:
+        return {"ok": False, "reason": "geoclue_unavailable"}
+    expected = {key: geolocation[key] for key in ("latitude", "longitude")}
+    try:
+        return page.evaluate("""expected => new Promise(resolve => {
+          if (!navigator.geolocation) return resolve({ok:false, reason:'api_unavailable'});
+          navigator.geolocation.getCurrentPosition(
+            p => resolve({
+              ok:true,
+              matches_injected:
+                Math.abs(p.coords.latitude-expected.latitude) < 1e-7 &&
+                Math.abs(p.coords.longitude-expected.longitude) < 1e-7,
+              accuracy_m:Math.round(p.coords.accuracy)
+            }),
+            e => resolve({ok:false, error_code:e.code}),
+            {enableHighAccuracy:true, timeout:12000, maximumAge:0}
+          );
+        })""", expected)
+    except Exception:
+        return {"ok": False, "reason": "browser_geolocation_error"}
 
 
 def login(page, cfg):
@@ -187,6 +284,26 @@ def last_attendance(page, cfg, employee):
     return recs[0] if recs else None
 
 
+def wait_for_attendance_transition(fetch, was_open, timeout=20, poll_interval=0.5):
+    """Poll Odoo until the latest attendance changes open/closed state.
+    :param fetch: callable returning the latest attendance record
+    :param was_open: whether the record was open before the UI click
+    :param timeout: maximum seconds to wait for Odoo to persist the change
+    :param poll_interval: seconds between reads
+    :return: the transitioned record, or None if state did not change
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        current = fetch()
+        is_open = bool(current and not current.get("check_out"))
+        if is_open != was_open:
+            return current
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(poll_interval, remaining))
+
+
 def minutes_since_last_toggle(att):
     """Minutes elapsed since the last check-in/out of an attendance record.
     :param att: hr.attendance dict or None
@@ -196,6 +313,31 @@ def minutes_since_last_toggle(att):
         return None
     last = datetime.strptime(att["check_out"] or att["check_in"], ODOO_DT).replace(tzinfo=timezone.utc)
     return (datetime.now(timezone.utc) - last).total_seconds() / 60
+
+
+def accept_location_fallback_dialog(page, timeout_ms=11000):
+    """Accept only Odoo's explicit no-valid-location confirmation.
+    :param page: logged-in Playwright page
+    :param timeout_ms: maximum wait for the geolocation fallback dialog
+    :return: True if the location fallback was accepted, otherwise False
+    """
+    location_error = re.compile(
+        r"no se puede obtener una ubicación válida|could not get a valid location|could not obtain a valid location",
+        re.IGNORECASE,
+    )
+    dialog = page.get_by_role("dialog").filter(has_text=location_error)
+    try:
+        dialog.wait_for(state="visible", timeout=timeout_ms)
+    except PlaywrightTimeoutError:
+        return False
+
+    continue_label = re.compile(r"^(continuar de todos modos|continue anyway)$", re.IGNORECASE)
+    button = dialog.get_by_role("button", name=continue_label)
+    matches = button.count()
+    if matches != 1:
+        raise RuntimeError(f"location_fallback_button_matches:{matches}")
+    button.click()
+    return True
 
 
 def click_systray(page, cfg, action):
@@ -212,7 +354,7 @@ def click_systray(page, cfg, action):
     button = page.locator(f".o_att_menu_container button.btn:has(i.{icon})")
     button.wait_for(state="visible", timeout=10000)
     button.click()
-    page.wait_for_timeout(2000)
+    accept_location_fallback_dialog(page)
 
 
 def main():
@@ -236,7 +378,8 @@ def main():
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=not opts.headed)
-        page = browser.new_page()
+        context = create_attendance_context(browser, cfg["url"])
+        page = context.new_page()
         try:
             login(page, cfg)
             employee = get_employee(page, cfg)
@@ -256,15 +399,37 @@ def main():
             if opts.expect and action != f"check_{opts.expect}":
                 emit("skipped", "unexpected_state", EXIT_SKIPPED, expected=f"check_{opts.expect}", would_do=action)
             if opts.dry_run:
-                emit("skipped", "dry_run", EXIT_SKIPPED, would_do=action, employee=employee["name"])
+                location = query_geoclue_location()
+                configured = configure_attendance_geolocation(context, cfg["url"], location)
+                location_check = verify_page_geolocation(page, location if configured else None)
+                emit(
+                    "skipped", "dry_run", EXIT_SKIPPED,
+                    would_do=action,
+                    employee=employee["name"],
+                    geolocation=location_check,
+                )
 
             if cfg["jitter_max"] > 0 and not opts.no_jitter:
                 time.sleep(random.uniform(0, cfg["jitter_max"] * 60))
 
+            location = query_geoclue_location()
+            configure_attendance_geolocation(context, cfg["url"], location)
             click_systray(page, cfg, action)
-            after = last_attendance(page, cfg, employee)
-            if bool(after and not after["check_out"]) == is_open:
-                emit("error", f"{action}_not_registered", EXIT_ERROR)
+            after = wait_for_attendance_transition(
+                lambda: last_attendance(page, cfg, employee), was_open=is_open
+            )
+            if after is None:
+                current = last_attendance(page, cfg, employee)
+                try:
+                    page.screenshot(path=str(BASE_DIR / "last_error.png"))
+                except Exception:
+                    pass
+                detail = (
+                    "Odoo did not reflect the attendance state change within 20 seconds; "
+                    f"latest check_in={current.get('check_in') if current else None}, "
+                    f"check_out={current.get('check_out') if current else None}"
+                )
+                emit("error", f"{action}_not_registered", EXIT_ERROR, detail=detail)
             emit("done", action, EXIT_DONE, employee=employee["name"], at=datetime.now(cfg["tz"]).strftime("%H:%M"))
         except SystemExit:
             raise

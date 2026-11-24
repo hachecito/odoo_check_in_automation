@@ -10,9 +10,7 @@ metadata:
 # Odoo Attendance
 
 ## Configuración (editar una sola vez al instalar)
-- **CMD** = `"<RUTA_REPO>/venv/Scripts/python.exe" "<RUTA_REPO>/odoo_checkin.py"`
-  - Sustituir `<RUTA_REPO>` por la carpeta donde se clonó el repositorio.
-  - En Linux/macOS: `"<RUTA_REPO>/venv/bin/python" "<RUTA_REPO>/odoo_checkin.py"`.
+- **CMD** = `"/home/hache/odoo_check_in_automation/venv/bin/python" "/home/hache/odoo_check_in_automation/odoo_checkin.py"`
 - Las credenciales están en el `.env` de esa carpeta. Nunca mostrarlas, pedirlas ni incluirlas en mensajes.
 
 En el resto de esta skill, `CMD` se refiere a ese comando.
@@ -26,15 +24,15 @@ Eres el asistente de fichaje del usuario en Odoo. Tu única tarea es ejecutar el
 
 El script decide por sí solo si hoy se trabaja: salta fines de semana, festivos y ausencias aprobadas en Odoo. No tienes que comprobar el calendario.
 
-Puede tardar hasta unos 6 minutos, porque espera un tiempo aleatorio de hasta 5 minutos antes de fichar. Usa un timeout de al menos 10 minutos.
+- Para tareas programadas, `JITTER_MAX_MINUTES=5` en `.env`. Hermes permite por defecto 600 segundos de inactividad en cron LLM (`HERMES_CRON_TIMEOUT`; `0` = sin límite). El timeout global de terminal del perfil es 180 segundos, así que al ejecutar `CMD` hay que pasar timeout de al menos 420 segundos al tool terminal para que quepa el jitter completo.
 
 ## Tareas programadas
 Si no existen, crear **dos tareas programadas (cron) independientes**, de lunes a viernes, en hora local:
 
 | Nombre | Cron | Comando | Objetivo |
 |---|---|---|---|
-| `odoo-entrada` | `25 9 * * 1-5` | `CMD --expect in` | Registrar la entrada (queda entre las 09:25 y las 09:30) |
-| `odoo-salida` | `30 17 * * 1-5` | `CMD --expect out` | Registrar la salida (queda entre las 17:30 y las 17:35) |
+| `odoo-entrada` | `25 9 * * 1-5` | `CMD --expect in` | Registrar la entrada entre las 09:25 y las 09:30 |
+| `odoo-salida` | `30 17 * * 1-5` | `CMD --expect out` | Registrar la salida entre las 17:30 y las 17:35 |
 
 - Las dos tareas usan esta skill y entregan el resultado al canal de notificaciones de Telegram.
 - Usar siempre `--expect`: impide que, si falló la entrada de la mañana, el disparo de la tarde registre una entrada en lugar de una salida.
@@ -87,11 +85,17 @@ Enviar todas las notificaciones al **canal de notificaciones de Telegram** ya co
 
 Opciones del script:
 - `--expect in|out`: solo actúa si la acción pendiente coincide.
-- `--dry-run`: calcula la decisión sin hacer clic.
+- `--dry-run`: calcula la acción sin pulsar el botón de asistencia; si hay una acción pendiente, también consulta GeoClue y verifica `navigator.geolocation`. El JSON incluye el estado y la precisión, nunca las coordenadas.
 - `--date AAAA-MM-DD`: simula otro día; activa `--dry-run` automáticamente.
 - `--list-offdays N`: lista las ausencias aprobadas y los festivos de los próximos N días.
 - `--no-jitter`: sin espera aleatoria.
 - `--headed`: muestra el navegador; solo para depurar en local, no usarla en tareas programadas.
+
+## Geolocalización
+- En cada ejecución real con acción pendiente, consulta GeoClue dinámicamente con `/usr/bin/python3` y transmite la lectura al contexto Playwright; nunca uses coordenadas fijas ni registres las coordenadas crudas.
+- Concede `geolocation` únicamente al origen configurado de Odoo y solo si GeoClue devolvió una lectura válida. Si no hay lectura, no concedas el permiso ni sustituyas el wizard de ubicación; conserva el manejo existente que acepta solo el botón exacto “Continuar de todos modos”.
+- En `--dry-run`, cuando haya una acción pendiente, consulta GeoClue y comprueba `navigator.geolocation` en la página autenticada sin pulsar asistencia. El JSON puede incluir `geolocation.ok`, `matches_injected`, `accuracy_m` o un motivo de fallo, nunca latitud/longitud.
+- Una precisión reportada de 25 km es aceptable para este usuario; no la rechaces por ser aproximada. Si la consulta falla o el navegador no recibe la posición, informa el resultado y deja el wizard como fallback.
 
 ## Pitfalls
 - No inventar resultados: informar solo de lo que devolvió el script.
